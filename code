@@ -1,0 +1,535 @@
+#define BLYNK_TEMPLATE_ID "TMPL62AUQcbvD"
+#define BLYNK_TEMPLATE_NAME "CaringPlant"
+
+
+
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <BH1750.h>
+#include <ESP32Servo.h>
+#include <Preferences.h>
+#include <time.h>
+#include <BlynkSimpleEsp32.h>
+
+
+
+
+// ====== CẤU HÌNH CHUNG ======
+char auth[] = "D-h_4UJPuBwlr8RJQXpy4Mp0ts2AEOT5";
+const char* ssid = "namviet";
+const char* password = "19753004";
+
+
+
+
+// Thời gian bật đèn tự động
+const int startLightHour = 8;
+const int endLightHour   = 17;
+
+
+
+
+// ====== PIN ======
+#define DHTPIN 33
+#define DHTTYPE DHT11
+#define SOIL_PIN 35
+#define RELAY_LIGHT 26
+#define RELAY_PUMP 27
+#define SERVO_PIN 25
+#define BTN_MODE 32
+#define BTN_PUMP 14
+#define BTN_LIGHT 12
+#define BTN_SHADE 13
+#define TRIG_PIN 18
+#define ECHO_PIN 19
+#define LED_PIN 23
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+
+
+
+// ====== OBJECT ======
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+DHT dht(DHTPIN, DHTTYPE);
+BH1750 lightMeter;
+Servo sunShadeServo;
+Preferences prefs;
+
+
+
+
+// ====== NGƯỠNG ======
+#define SOIL_MIN 20
+#define SOIL_MAX 60
+#define LIGHT_THRESHOLD 1000
+#define SERVO_OPEN_SPEED 130
+#define SERVO_CLOSE_SPEED 50
+#define SERVO_STOP_SPEED 90
+#define TANK_HEIGHT 17.0
+#define WATER_LOW_THRESHOLD 20
+#define SERVO_OPEN_TIME   5000
+#define SERVO_CLOSE_TIME  5000
+
+
+
+
+// ====== CALIBRATE CẢM BIẾN ĐỘ ẨM ĐẦU DÒ ======
+#define SOIL_WET_VALUE  1280
+#define SOIL_DRY_VALUE  4095
+
+
+
+
+// ====== BIẾN TOÀN CỤC ======
+float soilMoisture, lightLux, temperature;
+float displayLux = 0;
+float waterDistance = 0, waterLevel = 0, waterPercentage = 0;
+
+
+
+
+bool lightOn = false, pumpOn = false, shadeClosed = false, manualMode = false;
+unsigned long servoStartTime = 0, servoRunTime = 5000;
+bool servoMoving = false;
+int lastDay = -1;
+
+
+
+
+unsigned long previousBlinkMillis = 0;
+const long blinkInterval = 500;
+bool ledState = LOW;
+
+
+
+
+struct ButtonState {
+  bool lastReading = HIGH;
+  bool stableState = HIGH;
+  unsigned long lastDebounceTime = 0;
+};
+ButtonState btnMode, btnPump, btnLight, btnShade;
+const unsigned long debounceDelay = 50;
+
+
+
+
+unsigned long lastSensorUpdate = 0;
+const unsigned long sensorUpdateInterval = 1000;
+unsigned long lastButtonCheck = 0;
+const unsigned long buttonCheckInterval = 10;
+
+
+
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  dht.begin();
+  sunShadeServo.attach(SERVO_PIN);
+  sunShadeServo.write(SERVO_STOP_SPEED);
+
+
+
+
+  pinMode(RELAY_LIGHT, OUTPUT); pinMode(RELAY_PUMP, OUTPUT); pinMode(LED_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);    pinMode(ECHO_PIN, INPUT);
+  pinMode(BTN_MODE, INPUT_PULLUP); pinMode(BTN_PUMP, INPUT_PULLUP);
+  pinMode(BTN_LIGHT, INPUT_PULLUP); pinMode(BTN_SHADE, INPUT_PULLUP);
+
+
+
+
+  digitalWrite(RELAY_LIGHT, LOW); digitalWrite(RELAY_PUMP, LOW); digitalWrite(LED_PIN, LOW);
+
+
+
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED Error!"); while(1);
+  }
+
+
+
+
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(15,25); display.print("Dang ket noi WiFi..."); display.display();
+
+
+
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+  Serial.println("\nWiFi connected.");
+
+
+
+
+  Blynk.config(auth); Blynk.connect();
+  configTime(7*3600, 0, "pool.ntp.org");
+
+
+
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) lastDay = timeinfo.tm_mday;
+
+
+
+
+  if (!lightMeter.begin()) Serial.println("Loi BH1750!");
+
+
+
+
+  prefs.begin("garden", false);
+  loadPreferences();
+
+
+
+
+  Serial.println("Khoi dong hoan tat! Logic moi da duoc cap nhat!");
+}
+
+
+
+
+// ==================== LOOP ====================
+void loop() {
+  Blynk.run();
+
+
+
+
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  resetDailyData(timeinfo);
+
+
+
+
+  if (millis() - lastButtonCheck >= buttonCheckInterval) {
+    lastButtonCheck = millis();
+    checkButtons();
+  }
+
+
+
+
+  if (millis() - lastSensorUpdate >= sensorUpdateInterval) {
+    lastSensorUpdate = millis();
+    readSensors();
+
+
+
+
+    if (!manualMode) {
+      controlPump();       // ← ĐÃ CÓ ĐIỀU KIỆN MỰC NƯỚC
+      controlLight(timeinfo);
+      controlSunShade();   // ← ĐÃ CÓ ĐIỀU KIỆN NHIỆT ĐỘ > 35°C
+    }
+
+
+
+
+    showOnOLED(timeinfo);
+    savePreferences();
+
+
+
+
+    Blynk.virtualWrite(V4, (int)soilMoisture);
+    Blynk.virtualWrite(V5, temperature);
+    Blynk.virtualWrite(V6, displayLux);
+    Blynk.virtualWrite(V7, pumpOn ? 1 : 0);
+    Blynk.virtualWrite(V8, lightOn ? 1 : 0);
+    Blynk.virtualWrite(V9, shadeClosed ? 1 : 0);
+    Blynk.virtualWrite(V10, waterPercentage);
+    Blynk.virtualWrite(V11, (waterPercentage < WATER_LOW_THRESHOLD) ? 1 : 0);
+    Blynk.virtualWrite(V0, manualMode ? 1 : 0);
+  }
+
+
+
+
+  handleLedBlink();
+
+
+
+
+  if (servoMoving && millis() - servoStartTime >= servoRunTime) {
+    sunShadeServo.write(SERVO_STOP_SPEED);
+    servoMoving = false;
+  }
+}
+
+
+
+
+// ==================== ĐỌC CẢM BIẾN ====================
+void readSoilMoisture() {
+  int raw = analogRead(SOIL_PIN);
+  soilMoisture = map(raw, SOIL_WET_VALUE, SOIL_DRY_VALUE, 100, 0);
+  soilMoisture = constrain(soilMoisture, 0, 100);
+}
+
+
+
+
+void readSensors() {
+  readSoilMoisture();
+  lightLux = lightMeter.readLightLevel();
+  displayLux = lightLux * 1.7;
+  temperature = dht.readTemperature();
+
+
+
+
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  waterDistance = duration * 0.034 / 2;
+
+
+
+
+  waterLevel = TANK_HEIGHT - waterDistance;
+  if (waterLevel < 0) waterLevel = 0;
+  if (waterLevel > TANK_HEIGHT) waterLevel = TANK_HEIGHT;
+  waterPercentage = (waterLevel / TANK_HEIGHT) * 100;
+}
+
+
+
+
+// ==================== HIỂN THỊ OLED ====================
+void showOnOLED(struct tm timeinfo) {
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+
+
+
+
+  display.setCursor(0, 0);
+  display.printf("%s  %02d:%02d %02d/%02d\n",
+                 manualMode ? "MANUAL" : "AUTO",
+                 timeinfo.tm_hour, timeinfo.tm_min,
+                 timeinfo.tm_mday, timeinfo.tm_mon + 1);
+
+
+
+
+  display.setCursor(0, 10);
+  display.printf("Soil: %.0f%% Tem: %.1f C\n", soilMoisture, temperature);
+
+
+
+
+  display.setCursor(0, 20);
+  display.printf("Bright: %.0f lux\n", displayLux);
+
+
+
+
+  display.setCursor(0, 30);
+  display.printf("Pump: %s Light: %s\n", pumpOn ? "BAT " : "TAT", lightOn ? "BAT " : "TAT");
+
+
+
+
+  display.setCursor(0, 40);
+  display.printf("Luoi: %s\n", shadeClosed ? "MO" : "DONG");
+
+
+
+
+  display.setCursor(0, 50);
+  display.printf("Water: %.0f%%", waterPercentage);
+
+
+
+
+  display.display();
+}
+
+
+
+
+// ==================== ĐIỀU KHIỂN LƯỚI CHE (ƯU TIÊN NHIỆT ĐỘ > 35°C) ====================
+void controlSunShade() {
+  if (servoMoving) return;
+
+
+
+
+  // ƯU TIÊN 1: NHIỆT ĐỘ > 35°C → BẮT BUỘC ĐÓNG LƯỚI
+  if (temperature >= 35 && !shadeClosed) {
+    sunShadeServo.write(SERVO_CLOSE_SPEED);
+    shadeClosed = true;
+    servoMoving = true;
+    servoStartTime = millis();
+    servoRunTime = SERVO_CLOSE_TIME;
+    Serial.println("Nhiet do > 35C -> Dong luoi che nang!");
+    return;
+  }
+
+
+
+
+  // ƯU TIÊN 2: ÁNH SÁNG MẠNH → ĐÓNG LƯỚI
+  if (displayLux > 15000 && !shadeClosed) {
+    sunShadeServo.write(SERVO_CLOSE_SPEED);
+    shadeClosed = true;
+    servoMoving = true;
+    servoStartTime = millis();
+    servoRunTime = SERVO_CLOSE_TIME;
+    return;
+  }
+
+
+
+
+  // MỞ LƯỚI khi điều kiện an toàn (ánh sáng yếu + nhiệt độ ≤ 35°C)
+  if (displayLux < 10000 && shadeClosed && temperature <= 35) {
+    sunShadeServo.write(SERVO_OPEN_SPEED);
+    shadeClosed = false;
+    servoMoving = true;
+    servoStartTime = millis();
+    servoRunTime = SERVO_OPEN_TIME;
+  }
+}
+
+
+
+
+// ==================== ĐIỀU KHIỂN BƠM (CÓ KIỂM TRA MỰC NƯỚC) ====================
+void controlPump() {
+  // BẬT BƠM: chỉ khi đất khô + nhiệt độ OK + mực nước đủ (>=20%)
+  if (soilMoisture < SOIL_MIN && !pumpOn && temperature < 35 && waterPercentage >= WATER_LOW_THRESHOLD) {
+    digitalWrite(RELAY_PUMP, HIGH);
+    pumpOn = true;
+    Serial.println("Tuoi cay: Dat kho + Muc nuoc du");
+  }
+ 
+  // DỪNG BƠM: khi đất đủ ẩm HOẶC mực nước thấp (<20%)
+  else if (pumpOn && (soilMoisture > SOIL_MAX || waterPercentage < WATER_LOW_THRESHOLD)) {
+    digitalWrite(RELAY_PUMP, LOW);
+    pumpOn = false;
+    if (waterPercentage < WATER_LOW_THRESHOLD) {
+      Serial.println("DUNG BOM KHAN CAP: Muc nuoc qua thap!");
+    } else {
+      Serial.println("Dung bom: Dat da du am");
+    }
+  }
+}
+
+
+
+
+// ==================== ĐIỀU KHIỂN ĐÈN ====================
+void controlLight(struct tm timeinfo) {
+  if (timeinfo.tm_hour >= startLightHour && timeinfo.tm_hour < endLightHour) {
+    if (displayLux < LIGHT_THRESHOLD && !lightOn) {
+      digitalWrite(RELAY_LIGHT, HIGH); lightOn = true;
+    }
+    else if (displayLux > LIGHT_THRESHOLD && lightOn) {
+      digitalWrite(RELAY_LIGHT, LOW); lightOn = false;
+    }
+  }
+  else {
+    digitalWrite(RELAY_LIGHT, LOW); lightOn = false;
+  }
+}
+
+
+
+
+// ==================== CÁC HÀM CÒN LẠI (GIỮ NGUYÊN) ====================
+void handleLedBlink() {
+  if (waterPercentage < WATER_LOW_THRESHOLD) {
+    if (millis() - previousBlinkMillis >= blinkInterval) {
+      previousBlinkMillis = millis();
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState);
+    }
+  }
+  else {
+    digitalWrite(LED_PIN, LOW); ledState = LOW;
+  }
+}
+
+
+
+
+bool checkButton(int pin, ButtonState &btnState) {
+  bool reading = digitalRead(pin);
+  if (reading != btnState.lastReading) btnState.lastDebounceTime = millis();
+  if ((millis() - btnState.lastDebounceTime) > debounceDelay) {
+    if (reading != btnState.stableState) {
+      btnState.stableState = reading;
+      if (reading == LOW) return true;
+    }
+  }
+  btnState.lastReading = reading;
+  return false;
+}
+
+
+
+
+void checkButtons() {
+  if (checkButton(BTN_MODE, btnMode)) {
+    manualMode = !manualMode;
+    Blynk.virtualWrite(V0, manualMode ? 1 : 0);
+  }
+  if (manualMode) {
+    if (checkButton(BTN_PUMP, btnPump)) { pumpOn = !pumpOn; digitalWrite(RELAY_PUMP, pumpOn); Blynk.virtualWrite(V7, pumpOn); }
+    if (checkButton(BTN_LIGHT, btnLight)) { lightOn = !lightOn; digitalWrite(RELAY_LIGHT, lightOn); Blynk.virtualWrite(V8, lightOn); }
+    if (checkButton(BTN_SHADE, btnShade) && !servoMoving) {
+      shadeClosed = !shadeClosed;
+      sunShadeServo.write(shadeClosed ? SERVO_CLOSE_SPEED : SERVO_OPEN_SPEED);
+      servoRunTime = shadeClosed ? SERVO_CLOSE_TIME : SERVO_OPEN_TIME;
+      servoMoving = true; servoStartTime = millis();
+      Blynk.virtualWrite(V9, shadeClosed);
+    }
+  }
+}
+
+
+
+
+BLYNK_WRITE(V0) { manualMode = param.asInt(); }
+BLYNK_WRITE(V1) { if(param.asInt()==1 && manualMode) { pumpOn=!pumpOn; digitalWrite(RELAY_PUMP,pumpOn); Blynk.virtualWrite(V7,pumpOn); } }
+BLYNK_WRITE(V2) { if(param.asInt()==1 && manualMode) { lightOn=!lightOn; digitalWrite(RELAY_LIGHT,lightOn); Blynk.virtualWrite(V8,lightOn); } }
+BLYNK_WRITE(V3) {
+  if(param.asInt()==1 && manualMode && !servoMoving) {
+    shadeClosed = !shadeClosed;
+    sunShadeServo.write(shadeClosed ? SERVO_CLOSE_SPEED : SERVO_OPEN_SPEED);
+    servoRunTime = shadeClosed ? SERVO_CLOSE_TIME : SERVO_OPEN_TIME;
+    servoMoving = true; servoStartTime = millis();
+    Blynk.virtualWrite(V9, shadeClosed);
+  }
+}
+BLYNK_CONNECTED() { Blynk.syncVirtual(V0); }
+
+
+
+
+void savePreferences() { prefs.putBool("shade", shadeClosed); }
+void loadPreferences() { shadeClosed = prefs.getBool("shade", false); }
+void resetDailyData(struct tm timeinfo) {
+  if (timeinfo.tm_mday != lastDay) {
+    lastDay = timeinfo.tm_mday;
+    savePreferences();
+  }
+}
+
